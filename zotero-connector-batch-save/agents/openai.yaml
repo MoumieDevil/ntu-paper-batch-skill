@@ -1,0 +1,4 @@
+interface:
+  display_name: "NTU 批量下载论文（旧名称兼容）"
+  short_description: "兼容原 Zotero batch 调用名，转到新版 NTU 下载与校验流程"
+  default_prompt: "使用 $zotero-connector-batch-save，按新版 NTU 流程从我已打开的数据库下载论文并保存到指定 Zotero 集合。"

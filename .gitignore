@@ -1,0 +1,20 @@
+# Never publish downloaded or private research/session artifacts.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runs/
+downloads/
+artifacts/
+*.pdf
+*.caj
+*.ris
+*.bib
+*.sqlite*
+*.har
+*.log
+.env
+.env.*
+*cookies*
+*storage-state*
+*session-state*

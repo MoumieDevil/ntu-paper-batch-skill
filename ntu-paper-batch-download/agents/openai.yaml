@@ -1,0 +1,4 @@
+interface:
+  display_name: "NTU 批量下载论文"
+  short_description: "复用 NTU 机构访问，从三类数据库下载、校验论文并归档 Zotero"
+  default_prompt: "使用 $ntu-paper-batch-download，从我已打开的 NTU 数据库页面下载指定主题的论文，校验 PDF 并保存到我指定的 Zotero 集合。"
