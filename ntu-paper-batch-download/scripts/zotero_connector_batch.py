@@ -32,6 +32,9 @@ CONNECTOR_HEADERS = {
 MAX_PDF_BYTES = 150 * 1024 * 1024
 PAGE_SIZE = 100
 MAX_PAGES = 100
+SEARCH_PAGES = 2
+RECENT_LIMIT = 50
+LOCAL_IMPORT_URI = BASE_URL + "/local-verified-import"
 SUCCESS = {"dry_run", "saved_complete", "saved_metadata", "duplicate_complete"}
 
 
@@ -118,41 +121,118 @@ def normalize_doi(value):
     return urllib.parse.unquote(value).strip()
 
 
+class CandidateRows(list):
+    """List-compatible bounded API result; a full last page means possible truncation."""
+
+    def __init__(self, rows=(), *, truncated=False, pages_read=0):
+        super().__init__(rows)
+        self.truncated = truncated
+        self.pages_read = pages_read
+
+
+class MatchResults(list):
+    """Keep list compatibility while reporting conflicts and duplicate-check coverage."""
+
+    def __init__(self, rows=(), *, conflicts=(), coverage=None):
+        super().__init__(rows)
+        self.conflicts = list(conflicts)
+        self.coverage = coverage or {}
+
+
+def bounded_items(path, params=None, *, page_size=PAGE_SIZE, max_pages=SEARCH_PAGES):
+    rows, seen = [], set()
+    for page in range(max_pages):
+        query = dict(params or {}, limit=page_size, start=page * page_size)
+        batch = get_json(path + "?" + urllib.parse.urlencode(query))
+        if not isinstance(batch, list):
+            raise ZoteroError("Expected an API list, not a partial/error response")
+        for row in batch:
+            if not isinstance(row, dict) or not row.get("key"):
+                raise ZoteroError("Invalid item in bounded API response")
+            if row["key"] in seen:
+                raise ZoteroError("Bounded pagination repeated a key; retry the read after Zotero settles")
+            seen.add(row["key"])
+            rows.append(row)
+        if len(batch) < page_size:
+            return CandidateRows(rows, pages_read=page + 1)
+    return CandidateRows(rows, truncated=True, pages_read=max_pages)
+
+
 def query_items(term):
-    return paginated(API_ROOT + "/items/top", {"q": term, "qmode": "everything"})
+    return bounded_items(API_ROOT + "/items/top", {"q": term, "qmode": "everything"})
 
 
-def find_matches(doi="", title=""):
+def classify_candidates(rows, doi, title):
+    exact_doi, title_matches, conflicts = [], [], []
+    for row in rows:
+        data = row.get("data", {})
+        if data.get("deleted"):
+            continue
+        actual_doi = normalize_doi(data.get("DOI", ""))
+        if doi and actual_doi == doi:
+            exact_doi.append(row)
+        elif title and normalize_title(data.get("title", "")) == title:
+            if doi and actual_doi and doi != actual_doi:
+                conflicts.append(row)
+            else:
+                title_matches.append(row)
+    # An exact DOI identifies a version more precisely than its shared title.
+    return exact_doi or title_matches, [] if exact_doi else conflicts
+
+
+def core_search_terms(doi, title):
+    """At most two supplemental searches; results still require exact comparison."""
+    segments = re.findall(r"[\u3400-\u9fff]+|[a-z0-9]+(?:[-'][a-z0-9]+)*", title)
+    terms = []
+    if doi and "/" in doi:
+        terms.append(doi.split("/", 1)[1])
+    for segment in sorted(segments, key=len, reverse=True):
+        if len(segment) >= 4:
+            terms.append(segment)
+            # A suffix can survive an invisible character inside a Chinese title.
+            if re.fullmatch(r"[\u3400-\u9fff]{8,}", segment):
+                terms.append(segment[len(segment) // 2:])
+    return list(dict.fromkeys(t for t in terms if t not in (doi, title)))[:2]
+
+
+def find_matches(doi="", title="", collection_key=None):
     expected_doi, expected_title = normalize_doi(doi), normalize_title(title)
     if not expected_doi and not expected_title:
         raise ZoteroError("Provide a DOI or title for duplicate checking")
-    candidates = {}
-    for term in dict.fromkeys(t for t in (expected_doi, expected_title) if t):
-        for row in query_items(term):
-            candidates[row["key"]] = row
-    def classify(rows):
-        matches, conflicts = [], []
-        for row in rows:
-            data = row.get("data", {})
-            if data.get("deleted"):
-                continue
-            doi_match = expected_doi and normalize_doi(data.get("DOI", "")) == expected_doi
-            title_match = expected_title and normalize_title(data.get("title", "")) == expected_title
-            other_doi = normalize_doi(data.get("DOI", ""))
-            if title_match and expected_doi and other_doi and expected_doi != other_doi:
-                conflicts.append(row)
-            elif doi_match or title_match:
-                matches.append(row)
-        return matches, conflicts
+    candidates, truncated_sources = {}, []
+    query_count = 0
 
-    matches, conflicts = classify(candidates.values())
-    if not matches and not conflicts:
-        # Search indexing can miss invisible characters or DOI URL prefixes.
-        # A bounded read-only inventory fallback avoids blind duplicate creation.
-        matches, conflicts = classify(paginated(API_ROOT + "/items/top"))
-    if conflicts:
-        raise ZoteroError("Same-title record has a conflicting DOI; resolve identity manually")
-    return matches
+    def include(rows, label):
+        if getattr(rows, "truncated", False):
+            truncated_sources.append(label)
+        for row in rows:
+            candidates[row["key"]] = row
+
+    for term in dict.fromkeys(t for t in (expected_doi, expected_title) if t):
+        query_count += 1
+        include(query_items(term), "canonical_query_%s" % query_count)
+    matches, conflicts = classify_candidates(candidates.values(), expected_doi, expected_title)
+    complete = False
+    if not matches:
+        for term in core_search_terms(expected_doi, expected_title):
+            query_count += 1
+            include(query_items(term), "core_query_%s" % query_count)
+        if collection_key:
+            path = API_ROOT + "/collections/%s/items/top" % urllib.parse.quote(collection_key, safe="")
+            include(bounded_items(path, {"sort": "dateModified", "direction": "desc"},
+                                  max_pages=1), "selected_collection")
+        recent = bounded_items(API_ROOT + "/items/top", {"sort": "dateModified", "direction": "desc"},
+                               page_size=RECENT_LIMIT, max_pages=1)
+        include(recent, "recent_personal_items")
+        # A short global page enumerates a small personal library completely.
+        complete = not getattr(recent, "truncated", len(recent) >= RECENT_LIMIT)
+        matches, conflicts = classify_candidates(candidates.values(), expected_doi, expected_title)
+    coverage = {"strategy": "bounded_queries_collection_and_recent", "complete": complete,
+                "candidate_count": len(candidates), "query_count": query_count,
+                "truncated_sources": truncated_sources,
+                "warning": ("Small personal-library inventory was fully enumerated during this read; concurrent changes remain possible."
+                            if complete else "Bounded duplicate checks do not prove the whole library has no duplicates; older/unindexed records may be outside coverage.")}
+    return MatchResults(matches, conflicts=conflicts, coverage=coverage)
 
 
 def checked_text(value, label):
@@ -165,6 +245,40 @@ def checked_text(value, label):
     return value.strip()
 
 
+def first_author(data):
+    return next((c for c in data.get("creators", []) if c.get("creatorType") == "author"), {})
+
+
+def first_author_names(data):
+    creator = first_author(data)
+    first, last = creator.get("firstName", ""), creator.get("lastName", "")
+    return {normalize_title(n).replace(" ", "") for n in
+            (creator.get("name", ""), first + last, last + first) if n}
+
+
+def first_authors_compatible(expected, actual):
+    if first_author_names(expected).intersection(first_author_names(actual)):
+        return True
+    left, right = first_author(expected), first_author(actual)
+    left_last, right_last = normalize_title(left.get("lastName", "")), normalize_title(right.get("lastName", ""))
+    if not left_last or left_last != right_last:
+        return False
+    given = []
+    for creator in (left, right):
+        name = normalize_title(creator.get("firstName", ""))
+        letters = [c for c in name if c.isalpha()]
+        if not letters or not all("LATIN" in unicodedata.name(c, "") for c in letters):
+            return False
+        parts = re.findall(r"[^\W\d_]+(?:[-'][^\W\d_]+)*", name)
+        if not parts:
+            return False
+        given.append(parts)
+    # A missing middle name or a genuine initial may expand, but explicit
+    # conflicts (John vs James, or John Alan vs John Brian) need review.
+    return all(left == right or (min(len(left), len(right)) == 1 and left[0] == right[0])
+               for left, right in zip(*given))
+
+
 def identity_review_reason(expected, actual):
     """Title-only candidates need author/year context before repair or completion."""
     expected_doi = normalize_doi(expected.get("DOI", ""))
@@ -174,20 +288,11 @@ def identity_review_reason(expected, actual):
     if normalize_title(expected.get("title", "")) != normalize_title(actual.get("title", "")):
         return "Title identity differs"
 
-    def first_author_names(data):
-        authors = [c for c in data.get("creators", []) if c.get("creatorType") == "author"]
-        if not authors:
-            return set()
-        creator = authors[0]
-        first, last = creator.get("firstName", ""), creator.get("lastName", "")
-        return {normalize_title(n).replace(" ", "") for n in
-                (creator.get("name", ""), first + last, last + first) if n}
-
-    expected_year = re.search(r"\b(?:19|20)\d{2}\b", expected.get("date", ""))
-    actual_year = re.search(r"\b(?:19|20)\d{2}\b", actual.get("date", ""))
+    expected_year = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", expected.get("date", ""))
+    actual_year = re.search(r"(?<!\d)(?:19|20)\d{2}(?!\d)", actual.get("date", ""))
     if not expected_year or not actual_year or expected_year.group() != actual_year.group():
         return "Title-only match has missing or different publication year"
-    if not first_author_names(expected).intersection(first_author_names(actual)):
+    if not first_authors_compatible(expected, actual):
         return "Title-only match has missing or different first author"
     return None
 
@@ -273,7 +378,38 @@ def validate_pdf(path):
         pages = len(reader.pages)
     except Exception as exc:
         raise ZoteroError("PDF parser rejected the file or it is encrypted") from exc
-    return {"bytes": data, "sha256": hashlib.sha256(data).hexdigest(), "pages": pages, "size": len(data)}
+    page_texts, extraction_failures = [], 0
+    for index in range(min(2, pages)):
+        try:
+            page_texts.append(reader.pages[index].extract_text() or "")
+        except Exception:
+            extraction_failures += 1
+    full_text = re.sub(r"\s+", " ", " ".join(page_texts)).strip()
+    return {"bytes": data, "sha256": hashlib.sha256(data).hexdigest(), "pages": pages, "size": len(data),
+            "first_pages_text": full_text, "first_page_text": full_text[:500],
+            "has_extractable_text": bool(full_text), "text_extraction_failures": extraction_failures}
+
+
+def check_pdf_identity(pdf_info, item):
+    """Text hits assist review; they do not establish document identity on their own."""
+    text = normalize_title(pdf_info.get("first_pages_text", pdf_info.get("first_page_text", "")))
+    doi = normalize_doi(item.get("DOI", ""))
+    title = normalize_title(item.get("title", ""))
+    doi_match = bool(doi and re.search(r"(?<![\w.])" + re.escape(doi) + r"(?![\w./;():-])", text))
+    title_match = bool(title and title in text)
+    return {"pdf_text_matched": doi_match or title_match,
+            "doi_text_matched": doi_match, "title_text_matched": title_match,
+            "first_page_snippet": pdf_info.get("first_page_text", "")[:500],
+            "has_extractable_text": pdf_info.get("has_extractable_text", bool(text)),
+            "text_match_is_identity_proof": False}
+
+
+def inspect_pdf(path, doi="", title=""):
+    info = validate_pdf(path)
+    return dict(check_pdf_identity(info, {"DOI": doi, "title": title}),
+                pdf_pages=info["pages"], pdf_size=info["size"], sha256=info["sha256"],
+                text_extraction_failures=info.get("text_extraction_failures", 0),
+                identity_confirmation_required=True)
 
 
 def target_path(target):
@@ -312,6 +448,16 @@ def collection_path(row, by_key):
     return names
 
 
+def resolve_collection_key(target):
+    path = target_path(target)
+    collections = paginated(API_ROOT + "/collections")
+    by_key = {r["key"]: r for r in collections}
+    matches = [r for r in collections if collection_path(r, by_key) == path]
+    if len(matches) != 1:
+        raise ZoteroError("Selected collection path is missing or ambiguous in personal library")
+    return matches[0]["key"], path
+
+
 def resolve_target(args, has_pdf):
     target = selected_target()
     if target.get("name") != args.expect_collection or not target.get("id"):
@@ -322,13 +468,7 @@ def resolve_target(args, has_pdf):
         raise ZoteroError("Selected Zotero target does not permit stored attachments")
     if args.expect_library_id is not None and target.get("libraryID") != args.expect_library_id:
         raise ZoteroError("Selected library ID does not match --expect-library-id")
-    path = target_path(target)
-    collections = paginated(API_ROOT + "/collections")
-    by_key = {r["key"]: r for r in collections}
-    matches = [r for r in collections if collection_path(r, by_key) == path]
-    if len(matches) != 1:
-        raise ZoteroError("Selected collection path is missing or ambiguous in personal library")
-    key = matches[0]["key"]
+    key, _ = resolve_collection_key(target)
     if args.expect_collection_key and key != args.expect_collection_key:
         raise ZoteroError("Collection key does not match --expect-collection-key")
     return target, key
@@ -392,10 +532,20 @@ def verify_parent(row, collection_key, expected_pdf=None):
     return result
 
 
-def observe_created(doi, title, timeout=10):
+def observe_created(doi, title, timeout=10, *, collection_key=None):
+    """Only inspect recent rows, never rerun whole-library duplicate searches."""
     deadline = time.monotonic() + timeout
     while True:
-        matches = find_matches(doi, title)
+        candidates = {}
+        if collection_key:
+            path = API_ROOT + "/collections/%s/items/top" % urllib.parse.quote(collection_key, safe="")
+            rows = bounded_items(path, {"sort": "dateAdded", "direction": "desc"},
+                                 page_size=RECENT_LIMIT, max_pages=1)
+            candidates.update((row["key"], row) for row in rows)
+        rows = bounded_items(API_ROOT + "/items/top", {"sort": "dateAdded", "direction": "desc"},
+                             page_size=RECENT_LIMIT, max_pages=1)
+        candidates.update((row["key"], row) for row in rows)
+        matches, _ = classify_candidates(candidates.values(), normalize_doi(doi), normalize_title(title))
         if len(matches) > 1:
             raise ZoteroError("Multiple matching parents observed after write; do not retry automatically")
         if matches:
@@ -414,21 +564,44 @@ def save(args):
         raise ZoteroError("Check PDF first-page title/DOI, then pass --pdf-identity-confirmed")
     item = load_metadata(args.metadata, args.metadata_json, args.metadata_stdin)
     source_url = stable_url(args.source_url or item.get("url", ""))
-    if not source_url:
-        raise ZoteroError("Provide a verified canonical source URL")
     pdf_url = stable_url(args.pdf_url or source_url)
+    if not source_url:
+        if not args.allow_missing_url:
+            raise ZoteroError("Provide a verified canonical source URL or explicitly use --allow-missing-url with provenance in extra")
+        checked_text(item.get("extra"), "extra provenance for --allow-missing-url")
+        if args.pdf_url:
+            raise ZoteroError("Missing-url mode requires provenance in extra, not a separate --pdf-url")
+        item = dict(item, url="")
+        # This placeholder is only Connector protocol context, never item.url.
+        source_url = pdf_url = LOCAL_IMPORT_URI
     attachment_title = checked_text(args.attachment_title, "attachment title")
     pdf = validate_pdf(args.pdf) if args.pdf else None
     target, collection_key = resolve_target(args, bool(pdf))
-    matches = find_matches(item.get("DOI", ""), item["title"])
+    matches = find_matches(item.get("DOI", ""), item["title"], collection_key=collection_key)
+    coverage = getattr(matches, "coverage", {})
+    details = dict(check_pdf_identity(pdf, item) if pdf else {},
+                   duplicate_check=coverage, coverage_warning=coverage.get("warning"),
+                   duplicate_search_reviewed=bool(args.duplicate_search_reviewed))
+    conflicts = getattr(matches, "conflicts", [])
+    if conflicts:
+        return dict(details, status="needs_identity_review", candidate_item_key=conflicts[0]["key"],
+                    candidate_item_keys=[r["key"] for r in conflicts], reason="Same-title candidates have conflicting DOI; no exact DOI match found",
+                    writes_performed=False,
+                    action="Review whether these are different publication versions; do not attach or create automatically")
     if len(matches) > 1:
         raise ZoteroError("Ambiguous duplicate: multiple matching records; no write performed")
+    query_truncated = any(source.startswith(("canonical_query_", "core_query_"))
+                          for source in coverage.get("truncated_sources", []))
+    if matches and query_truncated and not coverage.get("complete") and not args.duplicate_search_reviewed:
+        return dict(details, status="needs_duplicate_review", collection_key=collection_key,
+                    candidate_item_keys=[r["key"] for r in matches], writes_performed=False,
+                    action="A truncated search may hide another matching parent; review duplicate identity before selecting this candidate")
     if matches:
         reason = identity_review_reason(item, matches[0].get("data", {}))
         if reason:
-            return {"status": "needs_identity_review", "candidate_item_key": matches[0]["key"],
-                    "reason": reason, "writes_performed": False,
-                    "action": "Review source, author, year and DOI; do not attach to or duplicate this candidate automatically"}
+            return dict(details, status="needs_identity_review", candidate_item_key=matches[0]["key"],
+                        reason=reason, writes_performed=False,
+                        action="Review source, author, year and DOI; do not attach to or duplicate this candidate automatically")
         report = verify_parent(matches[0], collection_key, pdf)
         if not report["in_collection"]:
             status = "needs_collection"
@@ -438,12 +611,16 @@ def save(args):
             status = "duplicate_complete"
         else:
             status = "duplicate_present"
-        return dict(report, status=status, writes_performed=False,
+        return dict(report, **details, status=status, writes_performed=False,
                     action="Reuse the exact existing parent; manually audit/attach/move if needed")
+    if not coverage.get("complete") and not args.duplicate_search_reviewed:
+        return dict(details, status="needs_duplicate_review", collection_key=collection_key,
+                    writes_performed=False,
+                    action="Bounded negative results are not a whole-library duplicate exclusion; separately review the library, then use --duplicate-search-reviewed if appropriate")
     if args.dry_run:
-        return {"status": "dry_run", "collection_key": collection_key,
-                "title": item["title"], "pdf_validated": bool(pdf),
-                "pdf_pages": pdf["pages"] if pdf else None, "writes_performed": False}
+        return dict(details, status="dry_run", collection_key=collection_key,
+                    title=item["title"], pdf_validated=bool(pdf),
+                    pdf_pages=pdf["pages"] if pdf else None, writes_performed=False)
 
     session_id, connector_id = "ntu-" + uuid.uuid4().hex, "item-" + uuid.uuid4().hex
     item = dict(item, id=connector_id)
@@ -459,7 +636,7 @@ def save(args):
         if status != 201:
             raise ZoteroError("saveItems was not confirmed with HTTP 201")
         stage = "observe_parent"
-        parent = observe_created(item.get("DOI", ""), item["title"])
+        parent = observe_created(item.get("DOI", ""), item["title"], collection_key=collection_key)
         if not parent:
             raise ZoteroError("Accepted parent is not observable yet")
         identity_reason = identity_review_reason(item, parent.get("data", {}))
@@ -488,23 +665,33 @@ def save(args):
             raise ZoteroError("Saved parent identity changed: " + identity_reason)
         report = verify_parent(parent, collection_key, pdf)
         complete = report["in_collection"] and (not pdf or report["pdf_verified"])
-        return dict(report, status=("saved_complete" if pdf else "saved_metadata") if complete else "partial",
+        return dict(report, **details, status=("saved_complete" if pdf else "saved_metadata") if complete else "partial",
                     stage=stage, writes_performed=True, retry_writes_automatically=False)
     except (ZoteroError, OSError, UnicodeError, ValueError) as exc:
-        return {"status": "partial" if parent else "uncertain", "stage": stage,
-                "item_key": parent.get("key") if parent else None,
-                "collection_key": collection_key, "error": str(exc),
-                "writes_performed": "possibly" if not parent else True,
-                "retry_writes_automatically": False,
-                "action": "Inspect Zotero for an existing parent/attachment before any retry; never create a second parent blindly"}
+        return dict(details, status="partial" if parent else "uncertain", stage=stage,
+                    item_key=parent.get("key") if parent else None,
+                    collection_key=collection_key, error=str(exc),
+                    writes_performed="possibly" if not parent else True,
+                    retry_writes_automatically=False,
+                    action="Inspect Zotero for an existing parent/attachment before any retry; never create a second parent blindly")
 
 
 def probe():
-    status, body = request("/connector/ping")
-    target = selected_target()
-    return {"connector_status": status, "connector_running": b"Zotero is running" in body,
-            "selected_target": {k: target.get(k) for k in
-                                ("name", "id", "libraryID", "libraryName", "editable", "libraryEditable", "filesEditable")}}
+    result = {"connector_status": None, "connector_running": False, "selected_target": {},
+              "collection_key": None, "collection_path": None, "collection_resolvable": False,
+              "target_warning": None}
+    try:
+        status, body = request("/connector/ping")
+        result.update(connector_status=status, connector_running=b"Zotero is running" in body)
+        target = selected_target()
+        result["selected_target"] = {k: target.get(k) for k in
+                                     ("name", "id", "libraryID", "libraryName", "editable", "libraryEditable", "filesEditable")}
+        result["collection_path"] = target_path(target)
+        key, path = resolve_collection_key(target)
+        result.update(collection_key=key, collection_path=path, collection_resolvable=True)
+    except (ZoteroError, OSError, UnicodeError, ValueError) as exc:
+        result["target_warning"] = str(exc)
+    return result
 
 
 def build_parser():
@@ -514,6 +701,11 @@ def build_parser():
     find = sub.add_parser("find", help="Find normalized DOI/title matches in personal library")
     find.add_argument("--doi", default="")
     find.add_argument("--title", default="")
+    find.add_argument("--collection-key", default=None, help="Include bounded target-collection candidates")
+    inspect = sub.add_parser("inspect-pdf", help="Read-only local PDF parsing and text-assisted identity review")
+    inspect.add_argument("--pdf", required=True)
+    inspect.add_argument("--doi", default="")
+    inspect.add_argument("--title", default="")
     cmd = sub.add_parser("save", help="Import one validated record; no automatic write retries")
     source = cmd.add_mutually_exclusive_group(required=True)
     source.add_argument("--metadata")
@@ -524,6 +716,8 @@ def build_parser():
     cmd.add_argument("--pdf-identity-confirmed", action="store_true")
     cmd.add_argument("--source-url", default="")
     cmd.add_argument("--pdf-url", default="")
+    cmd.add_argument("--allow-missing-url", action="store_true", help="Allow genuinely missing URL only with source provenance in extra")
+    cmd.add_argument("--duplicate-search-reviewed", action="store_true", help="Confirm a separate review of library duplicates beyond bounded API coverage")
     cmd.add_argument("--attachment-title", default="Full Text PDF")
     cmd.add_argument("--expect-collection", required=True)
     cmd.add_argument("--expect-collection-key", default="")
@@ -541,9 +735,13 @@ def main():
     try:
         if args.command == "probe":
             result = probe()
+        elif args.command == "inspect-pdf":
+            result = inspect_pdf(args.pdf, args.doi, args.title)
         elif args.command == "find":
-            matches = find_matches(args.doi, args.title)
+            matches = find_matches(args.doi, args.title, collection_key=args.collection_key)
             result = {"found": bool(matches), "ambiguous": len(matches) > 1,
+                      "conflicting_candidate_keys": [r["key"] for r in matches.conflicts],
+                      "duplicate_check": matches.coverage,
                       "items": [{"key": r["key"], "title": r.get("data", {}).get("title"),
                                  "doi": r.get("data", {}).get("DOI")} for r in matches]}
         else:
